@@ -1,0 +1,313 @@
+# START128 通常版用。秘密情報はこのファイルに書かず、GitHub Secretsへ登録します。
+name: START128 F-Droid Publish
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published, edited]
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fdroid-publish.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: start128-fdroid-publish
+  cancel-in-progress: false
+
+jobs:
+  # リリースからはmainの最新版の設定を実行し、古いタグの設定を使いません。
+  release-trigger:
+    if: github.repository == 'pkstart128/-' && github.event_name == 'release' && !github.event.release.draft && !github.event.release.prerelease
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Run publisher on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST repos/pkstart128/-/actions/workflows/fdroid-publish.yml/dispatches -f ref=main
+
+  build:
+    if: github.repository == 'pkstart128/-' && github.event_name != 'release' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install repository tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends apksigner default-jdk-headless
+          python -m pip install --disable-pip-version-check 'fdroidserver==2.4.5' 'androguard==4.1.4' 'qrcode==8.2' 'Pillow==13.0.0'
+      - name: Verify APK and generate signed repository
+        env:
+          FDROID_SIGNING_JSON: ${{ secrets.FDROID_SIGNING_JSON }}
+          GH_TOKEN: ${{ github.token }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          """Build a signed START128 binary repository from its latest GitHub release."""
+          import argparse
+          import base64
+          import hashlib
+          import html
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          import qrcode
+          import yaml
+          from PIL import Image, ImageDraw, ImageFont
+          from loguru import logger
+          logger.remove()
+          from androguard.core.apk import APK
+
+          REPOSITORY = 'pkstart128/-'
+          PACKAGE = 'jp.pokemonstart.emu.dualromtest'
+          APK_SIGNER = '933666797535cbeff9fdde733a403c811c138f4201de715cde4b280699d99e73'
+          REPO_FINGERPRINT = 'C827BD5525F098DA1998EED85780CD7ADE35F64DC0BC3D67592F3A23B0873E1A'
+          MAX_APK_SIZE = 150 * 1024 * 1024
+
+
+          def request(url, github_api=False):
+              if urllib.parse.urlsplit(url).scheme != 'https':
+                  raise RuntimeError('HTTPS is required')
+              headers = {'User-Agent': 'START128-FDroid-Publisher'}
+              if github_api:
+                  if urllib.parse.urlsplit(url).hostname != 'api.github.com':
+                      raise RuntimeError('Unexpected API host')
+                  headers['Accept'] = 'application/vnd.github+json'
+                  token = os.environ.get('GH_TOKEN')
+                  if token:
+                      headers['Authorization'] = 'Bearer ' + token
+              return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=90)
+
+
+          def inspect_apk(path, expected_package=PACKAGE, expected_signer=APK_SIGNER):
+              result = subprocess.run(['apksigner', 'verify', '--print-certs', str(path)],
+                                      capture_output=True, text=True, check=True)
+              signers = re.findall(r'Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]{64})', result.stdout)
+              if [s.lower() for s in signers] != [expected_signer]:
+                  raise RuntimeError('APK signing certificate does not match the existing normal app')
+              apk = APK(str(path))
+              if apk.get_package() != expected_package:
+                  raise RuntimeError('Only the normal START128 application ID is accepted; ST-Debug is excluded')
+              version_code = int(apk.get_androidversion_code())
+              if version_code <= 0:
+                  raise RuntimeError('Invalid APK versionCode')
+              return {'packageName': apk.get_package(), 'versionCode': version_code,
+                      'versionName': apk.get_androidversion_name(),
+                      'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                      'signingCertificateSha256': expected_signer, 'size': path.stat().st_size}
+
+
+          def check_previous(info, previous):
+              if not previous:
+                  return
+              if previous['packageName'] != PACKAGE:
+                  raise RuntimeError('Published repository contains an unexpected app')
+              old = int(previous['versionCode'])
+              if info['versionCode'] < old:
+                  raise RuntimeError('Refusing to publish a lower versionCode')
+              if info['versionCode'] == old and info['sha256'] != previous['sha256']:
+                  raise RuntimeError('APK changed without increasing versionCode; build a new version first')
+
+
+          def build(output, local_apk=None, offline=False):
+              if os.environ.get('GITHUB_REPOSITORY', REPOSITORY) != REPOSITORY:
+                  raise RuntimeError('This configuration is for pkstart128/- only')
+              base_url = os.environ.get('PAGES_BASE_URL', 'https://pkstart128.github.io/-').rstrip('/')
+              if urllib.parse.urlsplit(base_url).scheme != 'https':
+                  raise RuntimeError('An HTTPS Pages URL is required')
+              repo_url = base_url + '/fdroid/repo'
+              secret = os.environ.get('FDROID_SIGNING_JSON', '')
+              if not secret:
+                  raise RuntimeError('GitHub Settings > Secrets and variables > Actions に FDROID_SIGNING_JSON を登録してください')
+              payload = json.loads(secret)
+              password = payload['password']
+              alias = payload['alias']
+              if os.environ.get('GITHUB_ACTIONS') == 'true':
+                  print('::add-mask::' + password)
+              output = output.resolve()
+              if output.exists():
+                  raise RuntimeError('Output directory already exists; use a fresh build directory')
+              with tempfile.TemporaryDirectory(prefix='start128-fdroid-') as temporary:
+                  work = Path(temporary)
+                  os.chmod(work, 0o700)
+                  keystore = work / 'repository.jks'
+                  keystore.write_bytes(base64.b64decode(payload['keystore_b64'], validate=True))
+                  keystore.chmod(0o600)
+                  env = dict(os.environ, START_FDROID_KEY_PASS=password)
+                  cert = subprocess.check_output(['keytool', '-exportcert', '-keystore', str(keystore),
+                                                  '-alias', alias, '-storepass:env', 'START_FDROID_KEY_PASS'],
+                                                 env=env, stderr=subprocess.DEVNULL)
+                  fingerprint = hashlib.sha256(cert).hexdigest().upper()
+                  if fingerprint != REPO_FINGERPRINT:
+                      raise RuntimeError('The repository secret does not match this configuration')
+                  repo = work / 'repo'
+                  repo.mkdir()
+                  icon = Image.new('RGB', (128, 128), '#18242e')
+                  draw = ImageDraw.Draw(icon)
+                  draw.text((64, 64), 'ST', anchor='mm', font=ImageFont.load_default(size=64), fill='#c5f27c')
+                  icon.save(work / 'repo-icon.png')
+                  apk_path = repo / 'normal.apk'
+                  if local_apk:
+                      shutil.copyfile(local_apk, apk_path)
+                      release_url = 'https://github.com/' + REPOSITORY + '/releases'
+                  else:
+                      with request('https://api.github.com/repos/' + REPOSITORY + '/releases/latest', True) as r:
+                          release = json.load(r)
+                      if release['draft'] or release['prerelease']:
+                          raise RuntimeError('Only a published stable release can be distributed')
+                      assets = [a for a in release['assets'] if a['name'].lower().endswith('.apk')]
+                      if len(assets) != 1:
+                          raise RuntimeError('Attach exactly one normal-edition APK before publishing the release')
+                      asset = assets[0]
+                      if not 0 < asset['size'] <= MAX_APK_SIZE:
+                          raise RuntimeError('Unexpected APK size')
+                      url = asset['browser_download_url']
+                      if not url.startswith('https://github.com/' + REPOSITORY + '/releases/download/'):
+                          raise RuntimeError('Unexpected APK download URL')
+                      with request(url) as r, apk_path.open('wb') as f:
+                          total = 0
+                          while chunk := r.read(1024 * 1024):
+                              total += len(chunk)
+                              if total > MAX_APK_SIZE:
+                                  raise RuntimeError('APK download too large')
+                              f.write(chunk)
+                      if total != asset['size']:
+                          raise RuntimeError('Incomplete APK download')
+                      digest = asset.get('digest')
+                      if digest and digest.startswith('sha256:'):
+                          if hashlib.sha256(apk_path.read_bytes()).hexdigest() != digest[7:]:
+                              raise RuntimeError('APK digest does not match GitHub release metadata')
+                      release_url = release['html_url']
+                  info = inspect_apk(apk_path)
+                  if not offline:
+                      try:
+                          with request(base_url + '/release-info.json') as r:
+                              previous = json.load(r)
+                      except urllib.error.HTTPError as error:
+                          if error.code != 404:
+                              raise
+                          previous = None
+                      check_previous(info, previous)
+                  filename = PACKAGE + '_' + str(info['versionCode']) + '.apk'
+                  apk_path.rename(repo / filename)
+                  metadata = work / 'metadata'
+                  metadata.mkdir()
+                  (metadata / (PACKAGE + '.yml')).write_text(yaml.safe_dump({
+                      'Categories': ['Games'], 'License': 'Unknown', 'Name': 'START128',
+                      'AuthorName': 'pkstart128', 'WebSite': 'https://github.com/' + REPOSITORY,
+                      'Summary': 'START128 通常版（開発者配布）',
+                      'Description': '開発者が公開した通常版APKを配信します。ST-Debugは対象外です。',
+                      'AllowedAPKSigningKeys': [APK_SIGNER],
+                      'CurrentVersion': info['versionName'], 'CurrentVersionCode': info['versionCode'],
+                      'UpdateCheckMode': 'None', 'AutoUpdateMode': 'None',
+                  }, allow_unicode=True, sort_keys=False))
+                  config = {'repo_url': repo_url, 'repo_name': 'START128 通常版',
+                            'repo_description': 'START128 通常版の開発者配布リポジトリ。',
+                            'repo_icon': 'repo-icon.png',
+                            'repo_keyalias': alias, 'keystore': str(keystore),
+                            'keystorepass': password, 'keypass': password,
+                            'repo_pubkey': cert.hex(), 'apksigner': shutil.which('apksigner'),
+                            'make_current_version_link': False}
+                  config_path = work / 'config.yml'
+                  config_path.write_text(yaml.safe_dump(config, allow_unicode=True))
+                  config_path.chmod(0o600)
+                  subprocess.run(['fdroid', 'update'], cwd=work, check=True)
+                  # Check the signed index before exposing any generated files.
+                  with __import__('zipfile').ZipFile(repo / 'index-v1.jar') as z:
+                      index = json.loads(z.read('index-v1.json'))
+                  if set(index['packages']) != {PACKAGE}:
+                      raise RuntimeError('Generated index does not contain exactly the normal app')
+                  versions = index['packages'][PACKAGE]
+                  if len(versions) != 1 or versions[0]['versionCode'] != info['versionCode']:
+                      raise RuntimeError('Generated index version does not match the APK')
+                  if versions[0]['hash'] != info['sha256']:
+                      raise RuntimeError('Generated index APK hash mismatch')
+                  from fdroidserver import common, index as fdroid_index
+                  common.config = {'jarsigner': shutil.which('jarsigner'),
+                                   'apksigner': shutil.which('apksigner')}
+                  entry, _, _ = fdroid_index.get_index_from_jar(str(repo / 'entry.jar'), fingerprint=fingerprint)
+                  if entry['index']['sha256'] != hashlib.sha256((repo / 'index-v2.json').read_bytes()).hexdigest():
+                      raise RuntimeError('Signed v2 index hash mismatch')
+                  output.mkdir()
+                  shutil.copytree(repo, output / 'fdroid' / 'repo')
+                  if list(output.rglob('*.jks')) or list(output.rglob('config.yml')):
+                      raise RuntimeError('Private signing files must never be published')
+              registration = repo_url + '?fingerprint=' + fingerprint
+              qrcode.make(registration).save(output / 'qr.png')
+              (output / 'registration-url.txt').write_text(registration + '\n')
+              info.update({'apkUrl': repo_url + '/' + filename, 'releaseUrl': release_url})
+              (output / 'release-info.json').write_text(json.dumps(info, ensure_ascii=False, indent=2))
+              (output / '.nojekyll').touch()
+              (output / 'index.html').write_text('''<!doctype html><html lang="ja"><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1"><title>START128 更新配布</title>
+          <style>body{font:18px system-ui;max-width:640px;margin:40px auto;padding:20px;line-height:1.7}
+          a{overflow-wrap:anywhere}img{width:300px;max-width:100%;height:auto}button{font-size:18px;padding:12px}</style>
+          <h1>START128 通常版</h1><p>バージョン ''' + html.escape(info['versionName']) + '''</p>
+          <p>F-Droidのリポジトリ追加画面で、下のQRコードを読み取るか登録URLを入力してください。</p>
+          <img src="qr.png" alt="F-Droid登録用QRコード"><p><a href="''' + html.escape(registration, quote=True) + '''">登録URL</a></p>
+          <p><a href="registration-url.txt">登録URLをテキストで開く</a></p>
+          <p><a href="''' + html.escape(info['apkUrl'], quote=True) + '''">通常版APKをダウンロード</a></p>
+          <p>F-Droidではじめてインストール／更新するときは、端末の確認操作が必要です。
+          自動更新の利用には対応端末と設定が必要です。</p></html>''')
+              summary = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary, 'a') as f:
+                      f.write('## START128 配布データ生成完了\n\n次のデプロイが成功したら利用できます。\n\n'
+                              + '- 公開ページ: ' + base_url + '/\n'
+                              + '- 登録URL: ' + registration + '\n'
+                              + '- QR画像: ' + base_url + '/qr.png\n')
+              print('Generated signed normal-app repository:', info['versionName'], info['versionCode'])
+              return info
+
+
+          if __name__ == '__main__':
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--output', type=Path, default=Path('_site'))
+              parser.add_argument('--local-apk', type=Path)
+              parser.add_argument('--offline', action='store_true')
+              args = parser.parse_args()
+              build(args.output, args.local_apk, args.offline)
+          PYCODE
+      - name: Upload public files only
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: _site
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish repository and QR code
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
